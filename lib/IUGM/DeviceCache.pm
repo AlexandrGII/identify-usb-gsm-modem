@@ -3,15 +3,47 @@ package IUGM::DeviceCache;
 use IUGM qw( $CONFIG_CACHE_FILEPATH $CONFIG_CACHE_LOCK_FILEPATH );
 
 use Moo;
+use MooX::Types::MooseLike::Base qw( :all );
 use IUGM::Config;
 use IUGM::FileLock;
+use Readonly;
 use DBI;
 
 our $VERSION = '0.01';
 
+Readonly my $CACHE_TABLE_NAME => 'imei';
+
 has _dbh => (
     is => 'ro',
-    isa => InstanceOf[ 'DBI' ],
+    isa => InstanceOf[ 'DBI::db' ],
+    builder => 1,
+    lazy => 1,
+);
+
+has _config => (
+    is => 'ro',
+    isa => InstanceOf[ 'IUGM::Config' ],
+    builder => 1,
+    lazy => 1,  
+);
+
+has _cache_lock_filepath => (
+    is => 'ro',
+    isa => Str,
+    builder => 1,
+    lazy => 1,
+);
+
+has _cache_filepath => (
+    is => 'ro',
+    isa => Str,
+    builder => 1,
+    lazy => 1,
+);
+
+has _cache_filelock => (
+    is => 'ro',
+    isa => InstanceOf[ 'IUGM::FileLock' ],
     builder => 1,
     lazy => 1,
 );
@@ -19,123 +51,158 @@ has _dbh => (
 sub _build__dbh {
     my $self = shift;
 
-    # Implement a lock to prevent two processes from creating the database at the same time    
-    my $filelock = IUGM::FileLock->new(
-        lockfile => $CONFIG_CACHE_LOCK_FILEPATH
-    )->lock_ex;
+    my $was_locked = $self->_cache_filelock->is_locked;
+    $self->_cache_filelock->lock_ex
+        if ! $was_locked;
 
-    my $dbh = DBI->connect("dbi:SQLite:dbname=$CONFIG_CACHE_FILEPATH", undef, undef, {
-        'AutoCommit' => 1,
-        'RaiseError' => 1,
-        'sqlite_see_if_its_a_number' => 1,
-    });
+    # Connect
+    my $dbh = DBI->connect(
+        q{dbi:SQLite:dbname=} . $self->_cache_filepath,
+        undef,
+        undef,
+        {
+            'AutoCommit' => 1,
+            'RaiseError' => 1,
+            'sqlite_see_if_its_a_number' => 1,
+        }
+    );
     
-    $filelock->unlock;
+    $self->_cache_filelock->unlock
+        if ! $was_locked;
 
     return $dbh;
 }
 
+sub _build__cache_filelock {
+    my $self = shift;
+    
+    return IUGM::FileLock->new(
+        lockfile => $self->_cache_lock_filepath
+    );
+}
+
+sub _build__config {
+    return IUGM::Config->instance;
+}
+
+sub _build__cache_lock_filepath {
+    my $self = shift;
+    
+    return $self->_config->val($CONFIG_CACHE_LOCK_FILEPATH);
+}
+
+sub _build__cache_filepath {
+    my $self = shift;
+    
+    return $self->_config->val($CONFIG_CACHE_FILEPATH);
+}
+
 sub DEMOLISH {
+    my $self = shift;
+    
     if ($self->_dbh) {
         $self->_dbh->disconnect;
     }
 }
 
 # Returns undef if a value wasn't found, or, the value found was null
-sub cache_retrieve {
-    my ($device_devpath, $device_insertion_mtime) = @_;
+sub retrieve {
+    my $self = shift;
+    my $device_devpath = shift;
+    my $device_inserted = shift;
 
-    my $cache_value = undef;
+    # Sanity check
+    return if ! -e $self->_cache_filepath;
 
-    # Quick check
-    my $cache_filepath = get_cache_filepath();
-    if (! -e $cache_filepath) {
-        return undef;
-    }
+    # Enter critical region if we weren't there already
+    my $was_locked = $self->_cache_filelock->is_locked;
+    $self->_cache_filelock->lock_ex
+        if ! $was_locked;
     
-    my $cache_table_name = get_cache_table_name();
-    my $dbh = db_open();
-    if (db_imei_table_exists($dbh)) {
+    my $cache_value = undef;
+    if ($self->_imei_table_exists) {
         # Expire any entries
-        my $sth = $dbh->prepare(qq{
+        my $sth = $self->_dbh->prepare(qq{
             DELETE
-            FROM $cache_table_name
-            WHERE device_devpath = ? AND device_insertion_mtime != ?
+            FROM $CACHE_TABLE_NAME
+            WHERE device_devpath = ? AND device_inserted != ?
         });
-        $sth->execute($device_devpath, $device_insertion_mtime);
+        $sth->execute($device_devpath, $device_inserted);
     
         # Read from the table
-        $sth = $dbh->prepare(qq{
+        $sth = $self->_dbh->prepare(qq{
             SELECT imei
-            FROM $cache_table_name
-            WHERE device_devpath = ? AND device_insertion_mtime = ?
+            FROM $CACHE_TABLE_NAME
+            WHERE device_devpath = ? AND device_inserted = ?
         });
-        $sth->execute($device_devpath, $device_insertion_mtime);
+        $sth->execute($device_devpath, $device_inserted);
         
         if (my @row = $sth->fetchrow_array) {
             $cache_value = $row[0];
         }
     }
-    
-    db_close($dbh);
+        
+    # Exit critical region if we weren't there already
+    $self->_cache_filelock->unlock
+        if ! $was_locked;
     
     return $cache_value;
 }
 
-sub cache_store {
-    my ($device_devpath, $device_insertion_mtime, $imei) = @_;
-        
-    my $cache_table_name = get_cache_table_name();
+sub store {
+    my $self = shift;
+    my $device_devpath = shift;
+    my $device_inserted = shift;
+    my $imei = shift;
     
-    my $dbh = db_open();
-    if (! db_imei_table_exists($dbh)) {
-        db_create_imei_table($dbh);
+    # Enter critical region if we weren't there already
+    my $was_locked = $self->_cache_filelock->is_locked;
+    $self->_cache_filelock->lock_ex
+        if ! $was_locked;
+
+    # Create the table if necessary
+    if (! $self->_imei_table_exists) {
+        $self->_create_imei_table;
     }
 
     # Store our value
-    my $sth = $dbh->prepare(qq{
-        INSERT INTO $cache_table_name
-        (device_devpath, device_insertion_mtime, imei)
+    my $sth = $self->_dbh->prepare(qq{
+        INSERT INTO $CACHE_TABLE_NAME
+        (device_devpath, device_inserted, imei)
         VALUES (?, ?, ?)
     });
-    $sth->execute($device_devpath, $device_insertion_mtime, $imei);
+    $sth->execute($device_devpath, $device_inserted, $imei);
     
-    db_close($dbh);
+    # Exit critical region if we weren't there already
+    $self->_cache_filelock->unlock
+        if ! $was_locked;
 }
 
-sub db_imei_table_exists {
-    my $dbh = shift;
-    
-    my $cache_table_name = get_cache_table_name();
-    
-    # Has the table been created?
-    my $sth = $dbh->prepare(q{
+sub _imei_table_exists {
+    my $self = shift;
+
+    my $sth = $self->_dbh->prepare(q{
         SELECT 1 FROM sqlite_master WHERE type='table' AND name LIKE ?;
     });
-    $sth->execute($cache_table_name);
-    if (my @row = $sth->fetchrow_array) {
-        $sth->finish;
-        return 1;
-    }
+    $sth->execute($CACHE_TABLE_NAME);
+    return 1 if $sth->fetchrow_array;
     
     return 0;
 }
 
-sub db_create_imei_table {
-    my $dbh = shift;
+sub _create_imei_table {
+    my $self = shift;
     
-    my $cache_table_name = get_cache_table_name();
-    
-    # Create the table
-    my $sth = $dbh->prepare(qq{
-        CREATE TABLE IF NOT EXISTS $cache_table_name (
+    $self->_dbh->prepare(qq{
+        CREATE TABLE IF NOT EXISTS $CACHE_TABLE_NAME (
             device_devpath VARCHAR(255) NOT NULL,
-            device_insertion_mtime INT(11) NOT NULL,
+            device_inserted INT(11) NOT NULL,
             imei INT(15) NOT NULL,
-            PRIMARY KEY (device_devpath, device_insertion_mtime)
+            PRIMARY KEY (device_devpath, device_inserted)
         )
-    });
-    $sth->execute;
+    })->execute;
+    
+    return $self;
 }
 
 =head1 NAME

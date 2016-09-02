@@ -26,11 +26,6 @@ IUGM - The great new IUGM!
 
 Version 0.01
 
-=cut
-
-our $VERSION = '0.01';
-
-
 =head1 SYNOPSIS
 
 Quick summary of what the module does.

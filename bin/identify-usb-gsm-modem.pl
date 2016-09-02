@@ -1,4 +1,6 @@
-#!/usr/bin/perl -T
+#!/usr/bin/perl -Ilib
+
+use Modern::Perl;
 
 # TODO:
 # 1. Introduce the concept of logging and act appropriately based on how we are called (interactive or not)
@@ -23,149 +25,239 @@
 # the 4 is the configuration number
 # the 5 is the interface number
 
-use Moo;
-use MooX::Types::MooseLike::Base qw( :all );
-use IUGM::Types;
-with 'MooX::Getopt';
-use IUGM::Config;
-use IPC::Run qw( run );
-use Path::Tiny;
+package IdentifyUSBGSMModem {
 
-option devpath => (
-    is => 'ro',
-    isa => Devpath,
-    required => 1,
-);
+    use Moo;
+    use MooX::Options;
+    use MooX::Types::MooseLike::Base qw( :all );
+    use Types::Path::Tiny qw( Path );
+    use Path::Tiny;
+    use IUGM::Config;
+    use IUGM::SysfsPath;
+    use IUGM::VendorProductPair;
+    use IUGM::GSMModemInterface;
+    use IUGM::DeviceCache;
+    use IUGM::Error;
+    use IUGM::PriorityLogger;
+    use autodie;
 
-option devnode => (
-    is => 'ro',
-    isa => Devnode,
-    required => 1,
-);
+    option devnode => (
+        is => 'ro',
+        isa => Path,
+        required => 1,
+        order => 1,
+        short => 'n',
+        format => 's',
+        doc => 'specify the udev devnode',
+    );
 
-option vpp => (
-    is => 'ro'
-    isa => VendorProductPair,
-    required => 1,
-);
+    option devpath => (
+        is => 'ro',
+        isa => InstanceOf[ 'IUGM::SysfsPath' ],
+        required => 1,
+        order => 2,
+        short => 'p',
+        format => 's',
+        doc => 'specify the udev devpath',
+    );
 
-has _config => (
-    is => 'ro',
-    isa => InstanceOf[ 'IUGM::Config' ],
-    builder => 1,
-);
+    option vpp => (
+        is => 'ro',
+        isa => Str,
+        predicate => 1,
+        order => 3,
+        short => 'v',
+        format => 's',
+        doc => 'specify the modem vendor:product pair',
+    );
+    
+    option logfile => (
+        is => 'ro',
+        isa => Str,
+        predicate => 1,
+        order => 4,
+        short => 'l',
+        format => 's',
+        doc => 'specify a path to log events',
+    );
 
-sub _build__config {
-    return IUGM::Config->new;
-}
+    has _config => (
+        is => 'ro',
+        isa => InstanceOf[ 'IUGM::Config' ],
+        builder => 1,
+    );
+    
+    has _gsm_modem_interface => (
+        is => 'ro',
+        isa => InstanceOf[ 'IUGM::GSMModemInterface' ],
+        builder => 1,
+        lazy => 1,
+    );
+    
+    has _device_cache => (
+        is => 'ro',
+        isa => InstanceOf[ 'IUGM::DeviceCache' ],
+        builder => 1,
+        lazy => 1,
+    );
+    
+    has _logger => (
+        is => 'ro',
+        isa => InstanceOf[ 'IUGM::PriorityLogger' ],
+        builder => 1,
+    );
 
+    # Convert the string arguments into their object equivalents
+    sub BUILDARGS {
+        my ($class, %args) = @_;
 
-################################################################################
-# Main #########################################################################
-################################################################################
+        $args{devpath} = IUGM::SysfsPath->new( path => $args{devpath} )
+            if exists $args{devpath};
 
-sub run {
-    my $help;
-    my $man;
-    my $interface_devpath;
-    my $interface_devnode;
-    my $device_vendor_product_pair;
+        $args{devnode} = path($args{devnode})
+            if exists $args{devnode};
 
-    GetOptions(
-        'h|help' => \$help,
-        'm|man' => \$man,
-        'p|devpath=s' => \$interface_devpath,
-        'n|devnode:s' => \$interface_devnode,
-        'v|vendorproductpair:s' => \$device_vendor_product_pair
-    ) or pod2usage(2);
-    pod2usage(1) if $help;
-    pod2usage(-exitval => 0, -verbose => 2) if $man;
-    verify_options($interface_devpath, $interface_devnode, $device_vendor_product_pair);
-
-    # Get the device's devpath
-    my $device_devpath = get_device_devpath_for_interface($interface_devpath);
-
-    # Get the device's vendor:product pair if it wasn't provided
-    if (! defined $device_vendor_product_pair) {
-        $device_vendor_product_pair = get_vendor_product_pair_for_device($device_devpath);
+        if (exists $args{vpp}) {
+            my %vpp_args;
+            @vpp_args{qw(vendor_id product_id)} = split q{:}, $args{vpp};
+            $args{vpp} = IUGM::VendorProductPair->new( %vpp_args )->stringify;
+        }        
+    
+        return \%args;
     }
 
-    if (is_recognized_device($device_vendor_product_pair)) {
-        my $imei = get_imei_for_device($device_devpath, $device_vendor_product_pair);
+    sub _build__config {
+        return IUGM::Config->instance;
+    }
     
-        my $device_alias = get_device_alias($imei);
-    
-        if (defined $device_alias) {
-            my $interface_number = get_interface_number_for_interface($interface_devpath);
-            my $interface_names = get_name_for_device_interface_number($device_vendor_product_pair, $interface_number);
+    sub _build__gsm_modem_interface {
+        my $self = shift;
         
-            # A successful identification
-            print $device_alias . '-' . $interface_names[0] . "\n";
+        return IUGM::GSMModemInterface->new(
+            interface_sysfs_path => $self->devpath,
+            interface_devnode => $self->devnode,
+            ($self->has_vpp ? (vpp => $self->vpp) : ())
+        );
+    }
+    
+    sub _build__device_cache {
+        return IUGM::DeviceCache->new;
+    }
+    
+    sub _build__logger {
+        my $self = shift;
+
+        return IUGM::PriorityLogger->instance(
+            logfile => $self->has_logfile
+                ? $self->logfile
+                : $self->_config->val('logfile')
+        );
+    }
+
+    sub run {
+        my $self = shift;
+
+        my %command_line_options = $self->_command_line_options;
+        $self->_logger->log_event(
+            qq{Run started:\n\t}
+                . (join "\n\t", map {
+                    $_ . ': ' . $command_line_options{$_}
+                } keys %command_line_options)
+        );
+
+        my $identity = $self->_identify_usb_gsm_modem;
+        
+        $self->_logger->log_event(q{Run ended});
+        
+        die "Unknown USB GSM Modem" if ! defined $identity;
+        
+        print $identity, "\n";
+        
+        return;
+    }
+    
+    sub _command_line_options {
+        my $self = shift;
+        
+        my %command_line_options;
+        
+        $command_line_options{devnode} = $self->devnode;
+        $command_line_options{devpath} = $self->devpath->path->stringify;
+        $command_line_options{vpp} = $self->vpp
+            if $self->has_vpp;
+        $command_line_options{logfile} = $self->logfile
+            if $self->has_logfile;
+        
+        return %command_line_options;
+    }
+
+    sub _identify_usb_gsm_modem {
+        my $self = shift;
+
+        $self->_logger->log_info(
+            q{Device VPP: } . $self->_gsm_modem_interface->vpp
+        );
+
+        if ($self->_config->is_known_vpp($self->_gsm_modem_interface->vpp)) {
+            $self->_logger->log_info(
+                q{VPP found in configuration}
+            );
+            
+            my $imei = $self->device_imei;
+            $self->_logger->log_info(qq{IMEI: $imei});
+            
+            my $imei_alias = $self->_config->imei_alias($imei)
+                or IUGM::Error->throw("Unknown IMEI: $imei");
+            $self->_logger->log_info(qq{IMEI Alias: $imei_alias});
+                
+            my $name = $self->_config->device_interface_name(
+                $self->_gsm_modem_interface->vpp,
+                $self->_gsm_modem_interface->interface_number
+            );
+            
+            if (defined $name) {
+                $self->_logger->log_info(qq{Interface: $name});
+                return join '-', $imei_alias, $name;
+            }
+            else {
+                $self->_logger->log_info(qq{Interface name unknown});
+            }
         }
         else {
-            die "Device with IMEI $imei has no alias. Check config file.\n";
+            $self->_logger->log_info(
+                q{VPP not found in configuration}
+            );
         }
+        
+        return;
     }
-    else {
-        die "Device with vendor product pair $device_vendor_product_pair is not recognized.\n";
+
+    sub device_imei {
+        my $self = shift;
+
+        # First, check the cache        
+        my $device_inserted = $self->devpath->path->stat->[9];
+        my $imei = $self->_device_cache
+            ->retrieve($self->devpath, $device_inserted);
+        $self->_logger->log_info(
+            q{IMEI} . (defined $imei ? q{ } : q{ not }) . q{found in cache}
+        );
+
+        # If nothing was found in the cache, poll the device for the IMEI
+        # and store it in the cache.
+        if (! defined $imei) {
+            $imei = $self->_gsm_modem_interface->device_imei;
+            $self->_device_cache
+                ->store($self->devpath, $device_inserted, $imei);
+        }
+
+        return $imei;
     }
+
+    1;
 }
 
-################################################################################
-# Options ######################################################################
-################################################################################
-
-# Verify the command line arguments
-sub verify_options {
-    my ($interface_devpath, $interface_devnode, $vendor_product_pair) = @_;
-
-    if (! defined $interface_devpath) {
-        die "The interface path must be specified!\n";
-    }
-    elsif (! -e $interface_devpath) {
-        die "The interface path $interface_devpath does not exist!\n";
-    }
-    
-    if (defined $interface_devnode && !-e $interface_devnode) {
-        die "The interface node $interface_devnode does not exist!\n";
-    }
-
-    if (defined $vendor_product_pair && !is_valid_vendor_product_pair($vendor_product_pair)) {
-        die "The vendor product pair $vendor_product_pair is not valid!\n";
-    }
-}
-
-#
-# Sysfs
-#
-
-# Retrieve the IMEI for the USB device containing the provided devpath
-sub get_imei_for_device {
-    my ($device_devpath, $vendor_product_pair) = @_;
-    
-    # Check cache first
-    my @device_stats = stat $device_devpath;
-    my $device_insertion_mtime = $device_stats[9];
-    my $imei = cache_retrieve($device_devpath, $device_insertion_mtime);
-    if (defined $imei) {
-        if ($imei =~ m/^(\d{15})$/) {
-            $imei = $1;
-        }
-        else {
-            warn "Retrieved invalid IMEI from cache.\n";
-            undef $imei;
-        }
-    }
-    
-    # If nothing was found in the cache, get the IMEI from the device's control
-    # port, and store it in the cache.
-    if (! defined $imei) {
-        $imei = poll_device_for_imei($device_devpath, $vendor_product_pair);
-        cache_store($device_devpath, $device_insertion_mtime, $imei);
-    }
-    
-    return $imei;
-}
+IdentifyUSBGSMModem->new_with_options->run;
 
 =head1 NAME
 identify-gsm-modem.pl - Identify USB GSM modems by their IMEI.

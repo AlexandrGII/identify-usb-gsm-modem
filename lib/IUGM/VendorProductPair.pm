@@ -1,15 +1,29 @@
 package IUGM::VendorProductPair;
 
 use Moo;
-use IUGM::Types;
+use IUGM::Types qw( VendorID ProductID );
+use overload (
+    q{""} => sub { $_[0]->stringify }
+);
 
-has vendor_product_pair => (
+has vendor_id => (
     is => 'ro',
-    isa => VendorProductPair,
+    isa => VendorID,
+    required => 1,
+);
+
+has product_id => (
+    is => 'ro',
+    isa => ProductID,
     required => 1,
 );
 
 our $VERSION = '0.01';
+
+sub stringify {
+    my $self = shift;
+    return $self->vendor_id . ':' . $self->product_id;
+}
 
 1;
 

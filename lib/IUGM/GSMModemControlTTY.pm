@@ -1,12 +1,14 @@
-package IUGM::GSMModem;
+package IUGM::GSMModemControlTTY;
 
 use IUGM qw( $CONFIG_TEMP_DIR );
 
 use Moo;
-use IUGM::Types;
+use MooX::Types::MooseLike::Base qw( :all );
+use IUGM::Types qw( Devnode );
 use IUGM::Config;
 use Path::Tiny;
 use Device::Modem;
+use IUGM::Error;
 use autodie;
 
 our $VERSION = '0.01';
@@ -20,24 +22,46 @@ has devnode => (
 has _lockfile_path => (
     is => 'ro',
     isa => Str,
-    required => 1,
+    builder => 1,
+    lazy => 1,
+);
+
+has _device_filelock => (
+    is => 'ro',
+    isa => InstanceOf[ 'IUGM::FileLock' ],
+    builder => 1,
+    lazy => 1,
+);
+
+has _config => (
+    is => 'ro',
+    isa => InstanceOf[ 'IUGM::Config' ],
     builder => 1,
     lazy => 1,
 );
 
 sub _build__lockfile_path {
-    return Path::Tiny->path(
-        IUGM::Config->instance->val($CONFIG_TEMP_DIR),
-        Path::Tiny->path($self->devnode)->basename . q{.lock}
-    );
+    my $self = shift;
+    
+    return path($self->_config->val($CONFIG_TEMP_DIR))
+        ->child(path($self->devnode)->basename . q{.lock})
+        ->stringify;
+}
+
+sub _build__config {
+    return IUGM::Config->instance;
+}
+
+sub _build__device_filelock {
+    my $self = shift;
+
+    return IUGM::FileLock->new( lockfile => $self->_lockfile_path );
 }
 
 sub imei {
     my $self = shift;
 
-    my $file_lock = IUGM::FileLock->new(
-        lockfile => $self->_lockfile_path
-    )->lock_ex;
+    $self->_device_filelock->lock_ex;
 
     # Ask the device for its IMEI
     my $answer;
@@ -53,7 +77,7 @@ sub imei {
         );
     }
     
-    $file_lock->unlock;
+    $self->_device_filelock->unlock;
 
     # Process the modem response
     IUGM::Error->throw("No answer from USB device!")
@@ -70,11 +94,6 @@ IUGM::Modem - The great new IUGM::Modem!
 =head1 VERSION
 
 Version 0.01
-
-=cut
-
-our $VERSION = '0.01';
-
 
 =head1 SYNOPSIS
 

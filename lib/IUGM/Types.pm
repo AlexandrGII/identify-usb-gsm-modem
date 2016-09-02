@@ -8,7 +8,8 @@ our $VERSION = '0.01';
 
 our @EXPORT_OK = qw(
   ReadableFile
-  VendorProductPair
+  VendorID
+  ProductID
   Devnode
   SysfsPath
 );
@@ -20,7 +21,7 @@ sub ReadableFile () {
     ## no critic (RequireInterpolationOfMetachars, ProhibitImplicitNewlines)
     return quote_sub(
         q{ IUGM::Error->throw(
-            message => "$value is not a readable file",
+            message => $_[0] . " is not a readable file",
             type => 'ReadableFile',
             value => $_[0]
            )
@@ -34,18 +35,36 @@ sub ReadableFile () {
 }
 
 ## no critic (Capitalization)
-sub VendorProductPair () {
+sub VendorID () {
 ## use critic
     ## no critic (RequireInterpolationOfMetachars, ProhibitImplicitNewlines)
     return quote_sub(
         q{
             IUGM::Error->throw(
-                message => "$value is not a valid vendor product pair",
-                type => 'VendorProductPair',
+                message => $_[0] . " is not a valid vendor id",
+                type => 'VendorID',
                 value => $_[0]
             )
             unless defined $_[0]
-            && $_[0] =~ m/ ^ ([0-9a-f]{4}) : \1  $ /x;
+            && $_[0] =~ m/ ^ [0-9a-f]{4} $ /x;
+        }
+    );
+    ## use critic
+}
+
+## no critic (Capitalization)
+sub ProductID () {
+## use critic
+    ## no critic (RequireInterpolationOfMetachars, ProhibitImplicitNewlines)
+    return quote_sub(
+        q{
+            IUGM::Error->throw(
+                message => $_[0] . " is not a valid product id",
+                type => 'ProductID',
+                value => $_[0]
+            )
+            unless defined $_[0]
+            && $_[0] =~ m/ ^ ([0-9a-f]{4}) $ /x;
         }
     );
     ## use critic
@@ -58,13 +77,13 @@ sub Devnode () {
     return quote_sub(
         q{
             IUGM::Error->throw(
-                message => "$value is not a valid Devnode",
-                type => 'Devpath',
+                message => $_[0] . " is not a readable Devnode",
+                type => 'Devnode',
                 value => $_[0],
             )
             unless defined $_[0]
             && -e $_[0]
-            && -f $_[0]
+            && -c $_[0]
             && -r $_[0];
         }
     );
@@ -78,7 +97,7 @@ sub SysfsPath () {
     return quote_sub(
         q{
             IUGM::Error->throw(
-                message => "$value is not a valid Sysfs path",
+                message => $_[0] . " is not a readable Sysfs path",
                 type => 'SysfsDevpath',
                 value => $_[0],
             )

@@ -3,22 +3,23 @@ package IUGM::Config;
 use Moo;
 with 'MooX::Singleton';
 use MooX::Types::MooseLike::Base qw( :all );
-use IUGM::Types;
+use IUGM::Types qw( ReadableFile );
 use Config::Tiny;
 use Storable qw( dclone );
 use Readonly;
+use IUGM::Error;
 
 our $VERSION = '0.01';
 
 Readonly::Hash my %CONFIG_DEFAULTS => (
-    'temp_dir' => '/tmp',
-    'cache_filepath' => '/tmp/identify-usb-gsm-modem.cache',
-    'cache_lock_filepath' => '/tmp/identify-usb-gsm-modem.lock',
-    'cache_table_name' => 'gsm_modem_imei',
+    temp_dir => '/tmp',
+    cache_filepath => '/tmp/identify-usb-gsm-modem.cache',
+    cache_lock_filepath => '/tmp/identify-usb-gsm-modem.lock',
+    logfile => '/tmp/identify-usb-gsm-modem.log',
 );
 Readonly my $SECTION_VPP => 'known_vendor_product_pairs';
 Readonly my $SECTION_IMEI => 'known_imei';
-Readonly my $CONTROL_INTERFACE => 'control';
+Readonly my $CONTROL_INTERFACE_NAME => 'control';
 
 has config_file => (
     is => 'ro',
@@ -28,13 +29,13 @@ has config_file => (
 
 has _sensible_defaults => (
     is => 'ro',
-    isa => 'HashRef',
+    isa => HashRef,
     builder => 1,
 );
 
 has _config => (
     is => 'ro',
-    isa => 'HashRef',
+    isa => HashRef,
     builder => 1,
     lazy => 1,
 );
@@ -45,7 +46,7 @@ sub _build_config_file {
 
 sub _build__config {
     my $self = shift;
-    
+
     my $config = $self->_readfile;
     $self->_add_sensible_defaults($config);
 
@@ -62,19 +63,19 @@ sub _readfile {
         # Don't process root-level values
         next if $section eq '_';
         
-        $lc_section = lc $section;
+        my $lc_section = lc $section;
         
         # Process the General section
         if ($lc_section eq 'general') {
             $self->_readfile_general(
-                $config,
+                \%config,
                 $file_conf->{$section}
             );
         }
         # Process a vendor-product pair
         elsif ($lc_section =~ m/ ^ [0-9a-f]{4} : [0-9a-f]{4} $ /x) {
             $self->_readfile_vpp(
-                $config,
+                \%config,
                 $lc_section,
                 $file_conf->{$section}
             );
@@ -82,7 +83,7 @@ sub _readfile {
         # Process the devices section
         elsif ($lc_section eq 'devices') {
             $self->_readfile_devices(
-                $config,
+                \%config,
                 $file_conf->{$section}
             );
         }
@@ -110,7 +111,7 @@ sub _readfile_general {
     my $config = shift;
     my $section = shift;
     
-    @{ $config->{keys %{$section}} } = values %{$section};
+    @{$config}{keys %{$section}} = values %{$section};
     
     return $self;
 }
@@ -131,8 +132,8 @@ sub _readfile_vpp {
     $config->{$SECTION_VPP}->{$section_name} = dclone($section);
 
     # Sanity check
-    die "Device $lc_section must have a control interface specified in the config file!\n"
-        if ! exists $config->{$SECTION_VPP}->{$section_name}->{$CONTROL_INTERFACE};
+    die "Device $section_name must have a control interface specified in the config file!\n"
+        if ! exists $config->{$SECTION_VPP}->{$section_name}->{$CONTROL_INTERFACE_NAME};
             
     return $self;
 }
@@ -148,11 +149,11 @@ sub _readfile_devices {
 
     # Check and copy each imei
     foreach my $imei (keys %{$section}) {
-        if ($name =~ m/ ^ (\d{15}) $ /ix) {
+        if ($imei =~ m/ ^ (\d{15}) $ /ix) {
             $config->{$SECTION_IMEI}->{$imei} = $section->{$imei};
         }
         else {
-            die "Value $name in [devices] section is invalid format for an SECTION_IMEI!\n";
+            IUGM::Error->throw("Value $imei in [devices] section is not a valid IMEI!");
         }
     }
 
@@ -167,25 +168,25 @@ sub val {
     my $self = shift;
     my $val = shift;
     
-    die "$val is not in the config!"
+    IUGM::Error->throw("$val is not in the config!")
         if ! exists $self->_config->{$val};
         
     return $self->_config->{$val};
 }
 
 # Determine if we have a record of this vendor:product combination
-sub is_recognized_device {
+sub is_known_vpp {
     my $self = shift;
     my $vendor_product_pair = shift;
-   
+
     return 1 if exists $self->_config->{$SECTION_VPP}
         && exists $self->_config->{$SECTION_VPP}->{$vendor_product_pair};
-   
+
     return 0;
 }
 
 # Check the config for known SECTION_IMEI's alias
-sub imei_alias { # device_alias
+sub imei_alias {
     my $self = shift;
     my $imei = shift;
     
@@ -197,13 +198,13 @@ sub imei_alias { # device_alias
 }
 
 # Check the config for a device's interface name
-sub device_interface_name{ # get_names_for_device_interface_number
+sub device_interface_name { # get_names_for_device_interface_number
     my $self = shift;
     my $vendor_product_pair = shift;
     my $interface_number = shift;
     
     # Sanity check
-    return if ! $self->is_recognized_device($vendor_product_pair);
+    return if ! $self->is_known_vpp($vendor_product_pair);
 
     # Determine the interface name
     my $device = $self->_config->{$SECTION_VPP}->{$vendor_product_pair};
@@ -226,10 +227,10 @@ sub device_control_interface_number {
     my $vendor_product_pair = shift;
 
     IUGM::Error->throw("$vendor_product_pair does not have a configured control interface")
-        if ! $self->is_recognized_device($vendor_product_pair)
-        || ! exists $self->_config->{$SECTION_VPP}->{$vendor_product_pair}->{$CONTROL_INTERFACE};
+        if ! $self->is_known_vpp($vendor_product_pair)
+        || ! exists $self->_config->{$SECTION_VPP}->{$vendor_product_pair}->{$CONTROL_INTERFACE_NAME};
 
-    return $self->_config->{$SECTION_VPP}->{$vendor_product_pair}->{$CONTROL_INTERFACE};
+    return $self->_config->{$SECTION_VPP}->{$vendor_product_pair}->{$CONTROL_INTERFACE_NAME};
 }
 
 
