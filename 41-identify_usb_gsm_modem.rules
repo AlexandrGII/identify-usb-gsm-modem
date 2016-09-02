@@ -1,7 +1,0 @@
-# /usr/lib/udev/rules.d/41-identify-usb-stick.rules
-
-# Check the device's IMEI, and if it's known, associate it with it's alias
-# KERNEL=="ttyUSB*", ATTRS{idVendor}=="12d1", ATTRS{idProduct}=="1465", SYMLINK+="%k-", GROUP="uucp", MODE="0660"
-
-KERNEL=="ttyUSB*", ATTRS{idVendor}=="12d1", ATTRS{idProduct}=="1465", PROGRAM="/usr/local/sbin/identify-usb-gsm-modem.pl -p $sys$devpath -n $devnode -v $attr{idVendor}:$attr{idProduct}  ", SYMLINK+="ttyUSB-%c", GROUP="uucp", MODE="0660"
-KERNEL=="ttyUSB*", ATTRS{idVendor}=="19d2", ATTRS{idProduct}=="2003", PROGRAM="/usr/local/sbin/identify-usb-gsm-modem.pl -p $sys$devpath -n $devnode -v $attr{idVendor}:$attr{idProduct}  ", SYMLINK+="ttyUSB-%c", GROUP="uucp", MODE="0660"
